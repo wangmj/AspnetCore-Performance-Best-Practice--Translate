@@ -454,3 +454,177 @@ public class AsyncBadVoidController : Controller
    }
 }
 ```
+
+## 不要在后台线程中捕获 HttpContext
+
+### 不要这样做
+
+下面的例子展示了在一个闭包内捕获 httpContext，这是一个不好的练习，因为这个可能会导致：
+
+- 在 Request 范围外执行代码
+- 试图读取错误的 HttpContext
+
+```csharp
+[HttpGet("/fire-and-forget-1")]
+public IActionResult BadFireAndForget()
+{
+   _ = Task.Run(async () =>
+   {
+      await Task.Delay(1000);
+      var path = HttpContext.Request.Path;
+      Log(path);
+   });
+   return Accepted();
+}
+```
+
+### 这样做
+
+- 在请求过程中复制必要的数据到后台线程中
+- 不要从 controller 引用任何数据
+
+```csharp
+[HttpGet("/fire-and-forget-3")]
+public IActionResult GoodFireAndForget()
+{
+   string path = HttpContext.Request.Path;
+   _ = Task.Run(async () =>
+   {
+      await Task.Delay(1000);
+      Log(path);
+   });
+   return Accepted();
+}
+```
+
+后台任务应该以 HostService 的方式实现。更多的信息，请参考[使用 HostedService 实现后台任务](#使用HostedService实现后台任务)
+
+## 不要在后台线程捕获服务注入的到 controller 中
+
+### 不要这样做
+
+下面的例子展示了在一个闭包内捕获了 action 的参数。这是一个不好的做法。这个可能会导致在请求范围外执行，ContosoDbContext 属于请求的范围，将会导致 ObjectDisposedException 异常
+
+```csharp
+[HttpGet("/fire-and-forget-1")]
+public IActionResult FireAndForget1([FromServices]ContosoDbContext context)
+{
+   _ = Task.Run(async () =>
+   {
+      await Task.Delay(1000);
+      context.Contoso.Add(new Contoso());
+      await context.SaveChangesAsync();
+   });
+   return Accepted();
+}
+```
+
+### 这样做 下面的例子
+
+- 在后台线程中，用 IServiceScopeFactory 创建一个 scope 并注入。
+- 在后台线程中创建一个新的依赖注入 scope
+- 不要从 controller 中引用任何东西
+- 不要从 request 中捕获 ContosoDBContext
+
+```csharp
+[HttpGet("/fire-and-forget-3")]
+public IActionResult FireAndForget3([FromServices]IServiceScopeFactory serviceScopeFactory)
+{
+   _ = Task.Run(async () =>
+   {
+      await Task.Delay(1000);
+      using (var scope = serviceScopeFactory.CreateScope())
+      {
+         var context = scope.ServiceProvider.GetRequiredService<ContosoDbContext>();
+         context.Contoso.Add(new Contoso());
+         await context.SaveChangesAsync();
+      }
+   });
+   return Accepted();
+}
+```
+
+下面高亮部分代码：
+
+- 为后台操作的生命周创建了一个依赖注入的 scope，并且从里面解析服务
+- 在正确的 scope 内使用 ContosoDbContext
+
+```csharp
+[HttpGet("/fire-and-forget-3")]
+public IActionResult FireAndForget3([FromServices]IServiceScopeFactory serviceScopeFactory)
+{
+   _ = Task.Run(async () =>
+   {
+      await Task.Delay(1000);
+      using (var scope = serviceScopeFactory.CreateScope())
+      {
+         var context =
+         scope.ServiceProvider.GetRequiredService<ContosoDbContext>();
+         context.Contoso.Add(new Contoso());
+         await context.SaveChangesAsync();
+   }
+   });
+   return Accepted();
+}
+```
+
+## 不要在返回 body 已经开始后修改 statusCode 和 headers
+
+ASP.NET Core 不会缓存 HTTP 响应报文，当响应开始被写入时：
+
+- 响应头已经发送给客户端了
+- 不再可能修改响应报文头了
+
+### 不要这样做
+
+下面的代码试图在响应已经开始后添加响应头
+
+```csharp
+app.Use(async(context,next)=>{
+   await next();
+   context.Response.Headers["test"]="test value";
+})
+```
+
+在上面的代码中， 如果在 next()方法中已经写入了 response，context.Response.Headers["test"]="test value"可能会抛出异常
+
+### 这样做
+
+下面的例子演示了在写入 response 前进行检查响应是否已经开始
+
+```csharp
+app.Use(async(context,next)=>{
+   await next();
+   if(!context.Response.HasStarted)
+      context.Response.Headers["test"]="test value";
+})
+```
+
+### 这样做
+
+下面的例子使用 HttpResponse.OnStarting 在响应标题发送到客户端前设置响应标题
+检查响应是否没开始允许注册一个回调，这个回调可以在响应头被写入前执行，检查响应是否已经开始
+
+- 提供了实时添加或重写响应头的能力。
+- 不需要了解管道中下一个中间件。
+
+```csharp
+app.Use(async(context,next)=>{
+  context.Response.OnStarting(()=>{
+     context.Response.Headers["someheader"]="somevalue";
+     return Task.CompleteTask;
+  });
+  await next();
+})
+```
+
+## 如果已经开始写入响应报文，则不要调用 next 方法
+
+组件只有在他们能操作和处理响应时才被期望调用
+使用进程内的 iis 托管
+使用进程内托管，一个 ASP.NET Core 程序在同一个进程内运行。托管在进程内相比进程外提升了性能，原因是请求不在被在回环适配器代理。回环适配器（loopback adapter）是一个网络接口，这个网络接口负责将传出的网络流量返回同一台机器。iis 通过[window 进程激活服务](#https://learn.microsoft.com/en-us/iis/manage/provisioning-and-managing-iis/features-of-the-windows-process-activation-service-was)管理进程。
+
+在 ASP.NET Core3.0 及以后，项目默认使用进程内托管模式
+更多信息，请参考在[IIS 内托管 ASP.NET core 程序](#https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/iis/?view=aspnetcore-6.0)
+
+## 使用 HostedService 实现后台任务
